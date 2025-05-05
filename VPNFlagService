@@ -1,1 +1,197 @@
+package com.example;
 
+import android.content.Intent;
+import android.net.VpnService;
+import android.os.ParcelFileDescriptor;
+import android.util.Log;
+
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.util.HashSet;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+public class VpnFlagService extends VpnService {
+    private static final String TAG = "VPNFlagService";
+    private ParcelFileDescriptor vpnInterface;
+    private Thread monitorThread; //Separate thread to update the domain list
+    private ScheduledExecutorService scheduler; //For updating domain list
+    private final HashSet<String> flaggedDomains = new HashSet<>();
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        Log.d(TAG, "Starting VPN Service");
+
+        initializeFlaggedDomains(); //Intializes flagged domain list for the service to check against
+
+        // This section is used to update the list of flagged domains. 
+        scheduler = Executors.newSingleThreadScheduledExecutor();
+        scheduler.scheduleAtFixedRate(this::updateBlockedDomains, 0, 60, TimeUnit.SECONDS);
+
+
+        //Builds and sets parameters for the VPN.  This particular VPN is set up to act as a sort of network sniffer so it passes network traffic to Google's DNS server
+        Builder builder = new Builder();
+        builder.setSession("VpnMonitor")
+                .addAddress("172.16.0.2", 30)  // Should be safe range.  It will avoid the normal 192.xxx addresses
+                .addDnsServer("8.8.8.8")       // Google DNS
+                .addRoute("8.8.8.8", 32);      // Route DNS only
+
+        try {
+            java.net.DatagramSocket socket = new java.net.DatagramSocket();
+            protect(socket);
+            Log.d(TAG, "Socket protected for DNS");
+            socket.close();
+        } catch (Exception e) {
+            Log.e(TAG, "Socket protect failed: " + e.getMessage());
+        }
+
+      
+        try {
+            vpnInterface = builder.establish();
+            if (vpnInterface != null) {
+                Log.d(TAG, "VPN Established - FD: " + vpnInterface.getFd());
+                monitorThread = new Thread(this::monitorTraffic);
+                monitorThread.start();
+            } else {
+                Log.d(TAG, "VPN failed to establish");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "VPN start failed: " + e.getMessage());
+        }
+
+        return START_STICKY;
+    }
+
+    private void initializeFlaggedDomains() {
+        flaggedDomains.clear();
+        flaggedDomains.add("NotApprovedDomain.com");
+        Log.d(TAG, "Flagged domains initialized: " + flaggedDomains);
+    }
+
+
+    //This method can be modified to add a list o blocked or flagged domains.  
+    private void updateBlockedDomains() {
+        try {
+            HashSet<String> newDomains = new HashSet<>();
+            synchronized (flaggedDomains) {
+                flaggedDomains.clear();
+                flaggedDomains.addAll(newDomains);
+            }
+            Log.d(TAG, "Flagged domains updated");
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to update flagged domains: " + e.getMessage());
+        }
+    }
+
+
+    //This section filters and logs if a flagged domain is accessed.
+    private void monitorTraffic() {
+        Log.d(TAG, "Monitoring started");
+        try {
+            FileChannel inChannel = new FileInputStream(vpnInterface.getFileDescriptor()).getChannel();
+            FileChannel outChannel = new FileOutputStream(vpnInterface.getFileDescriptor()).getChannel();
+            ByteBuffer buffer = ByteBuffer.allocate(2048);
+
+            while (!Thread.interrupted()) {
+                buffer.clear();
+                int bytesRead = inChannel.read(buffer);
+                if (bytesRead > 0) {
+                    buffer.flip();
+                    byte[] packet = new byte[bytesRead];
+                    buffer.get(packet);
+                    String hex = bytesToHex(packet);
+                    Log.d(TAG, "Raw packet: " + hex);
+
+                    int destIp = ((packet[16] & 0xFF) << 24) | ((packet[17] & 0xFF) << 16) |
+                            ((packet[18] & 0xFF) << 8) | (packet[19] & 0xFF);
+                    int srcIp = ((packet[12] & 0xFF) << 24) | ((packet[13] & 0xFF) << 16) |
+                            ((packet[14] & 0xFF) << 8) | (packet[15] & 0xFF);
+                    String domain = null;
+                    if (packet[9] == 17 && destIp == 0x08080808) { // UDP query to 8.8.8.8
+                        domain = extractDomain(packet);
+                    } else if (packet[9] == 17 && srcIp == 0x08080808) { // Response from 8.8.8.8
+                        Log.d(TAG, "DNS response from 8.8.8.8");
+                    }
+
+                    if (domain != null) {
+                        Log.d(TAG, "Domain: " + domain);
+                        synchronized (flaggedDomains) {
+                            if (flaggedDomains.contains(domain)) {
+                                Log.d(TAG, "Flagged Domain Accessed at: " + System.currentTimeMillis() + ": " + domain);
+                            }
+                        }
+                    }
+
+                    buffer.rewind();
+                    outChannel.write(buffer);
+                    Log.d(TAG, "Bytes written: " + bytesRead);
+                } else if (bytesRead == -1) {
+                    Log.d(TAG, "Input closed");
+                    break;
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Monitoring error: " + e.getMessage());
+        }
+    }
+
+    private String extractDomain(byte[] packet) {
+        try {
+            if (packet.length < 28 || packet[9] != 17) return null;
+            int dataStart = (packet[0] & 0x0F) * 4 + 8;
+            if (packet.length < dataStart + 12) return null;
+
+            int qdCount = ((packet[dataStart + 4] & 0xFF) << 8) | (packet[dataStart + 5] & 0xFF);
+            if (qdCount < 1) return null;
+
+            int pos = dataStart + 12;
+            StringBuilder domain = new StringBuilder();
+            while (pos < packet.length && packet[pos] != 0) {
+                int len = packet[pos] & 0xFF;
+                pos++;
+                if (pos + len > packet.length) return null;
+                domain.append(new String(packet, pos, len, "UTF-8")).append(".");
+                pos += len;
+            }
+            if (domain.length() > 0) {
+                domain.setLength(domain.length() - 1);
+                return domain.toString().toLowerCase();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Parse error: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) {
+            sb.append(String.format("%02x ", b));
+        }
+        return sb.toString();
+    }
+
+
+    //This section cleans up the VPN on closing.
+    @Override
+    public void onDestroy() {
+        if (scheduler != null) {
+            scheduler.shutdownNow();
+        }
+        if (monitorThread != null) {
+            monitorThread.interrupt();
+        }
+        if (vpnInterface != null) {
+            try {
+                vpnInterface.close();
+            } catch (Exception e) {
+                Log.e(TAG, "VPN close error: " + e.getMessage());
+            }
+        }
+        Log.d(TAG, "VPN Stopped");
+        super.onDestroy();
+    }
+}
