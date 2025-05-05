@@ -35,16 +35,6 @@ This project showcases my ability to:
 - Parental control apps to restrict access to specific websites.
 - Debugging tools for network traffic analysis on Android devices.
 
-## Setup and Usage
-1. **Prerequisites**: Android Studio, Android SDK (API 21+).
-2. **Clone the Repository**:
-   ```bash
-   git clone <your-repo-url>
-   ```
-3. **Build and Run**: Open the project in Android Studio, sync Gradle, and deploy to an Android device or emulator.
-4. **Permissions**: Grant VPN permissions when prompted by the Android system.
-5. **Customize**: Modify the `initializeFlaggedDomains` method to add or update flagged domains.
-
 ## Future Enhancements
 - Integrate a remote API to fetch flagged domains dynamically.
 - Add a user interface to display real-time monitoring logs.
